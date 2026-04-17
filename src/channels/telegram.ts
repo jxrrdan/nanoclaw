@@ -118,7 +118,13 @@ export class TelegramChannel implements Channel {
     const bot = new Bot(this.botToken, {
       client: {
         baseFetchConfig: {
-          agent: new https.Agent({ keepAlive: true }),
+          // keepAlive: false — each request uses a fresh TCP connection.
+          // With keepAlive: true the HTTPS agent reuses the connection that
+          // served a getUpdates long-poll for subsequent sendMessage calls;
+          // Telegram sees that connection as an active polling session and
+          // 409s the next getUpdates. Disabling keepAlive eliminates the
+          // connection reuse that triggers the conflict.
+          agent: new https.Agent({ keepAlive: false }),
           compress: true,
         },
       },
