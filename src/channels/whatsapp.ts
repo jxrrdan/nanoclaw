@@ -60,6 +60,7 @@ export class WhatsAppChannel implements Channel {
 
   private sock!: WASocket;
   private connected = false;
+  private headlessSkipped = false;
   private lidToPhoneMap: Record<string, string> = {};
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
@@ -149,10 +150,22 @@ export class WhatsAppChannel implements Channel {
         const msg =
           'WhatsApp authentication required. Run /setup in Claude Code.';
         logger.error(msg);
-        exec(
-          `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
-        );
-        setTimeout(() => process.exit(1), 1000);
+        // In a headless/cloud environment (e.g. Kubernetes) there is no
+        // terminal to scan a QR code, so exit would cause a crash loop.
+        // Disable reconnects and shut down gracefully; other channels continue.
+        const isHeadless = !!process.env.KUBERNETES_SERVICE_HOST;
+        if (isHeadless) {
+          logger.warn(
+            'Running headless — WhatsApp disabled until credentials are provided.',
+          );
+          this.headlessSkipped = true;
+          this.sock?.end(undefined);
+        } else {
+          exec(
+            `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
+          );
+          setTimeout(() => process.exit(1), 1000);
+        }
       }
 
       if (connection === 'close') {
@@ -160,7 +173,8 @@ export class WhatsAppChannel implements Channel {
         const reason = (
           lastDisconnect?.error as { output?: { statusCode?: number } }
         )?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut;
+        const shouldReconnect =
+          reason !== DisconnectReason.loggedOut && !this.headlessSkipped;
         logger.info(
           {
             reason,
@@ -180,7 +194,7 @@ export class WhatsAppChannel implements Channel {
               });
             }, 5000);
           });
-        } else {
+        } else if (!this.headlessSkipped) {
           logger.info('Logged out. Run /setup to re-authenticate.');
           process.exit(0);
         }
@@ -549,4 +563,14 @@ export class WhatsAppChannel implements Channel {
   }
 }
 
-registerChannel('whatsapp', (opts: ChannelOpts) => new WhatsAppChannel(opts));
+registerChannel('whatsapp', (opts: ChannelOpts) => {
+  // Skip WhatsApp entirely if no credentials exist.
+  // This prevents the channel from blocking startup (connect() hangs waiting
+  // for a QR scan that can never happen in a headless/cloud environment).
+  const credsFile = path.join(STORE_DIR, 'auth', 'creds.json');
+  if (!fs.existsSync(credsFile)) {
+    logger.info('WhatsApp credentials not found — channel disabled. Run /setup to configure.');
+    return null;
+  }
+  return new WhatsAppChannel(opts);
+});

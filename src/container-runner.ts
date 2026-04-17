@@ -186,9 +186,12 @@ function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  for (const sub of ['messages', 'tasks', 'input']) {
+    const dir = path.join(groupIpcDir, sub);
+    fs.mkdirSync(dir, { recursive: true });
+    // Agent containers run as non-root and need write access to delete IPC files.
+    fs.chmodSync(dir, 0o777);
+  }
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',

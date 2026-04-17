@@ -90,7 +90,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -105,15 +108,21 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async connect(): Promise<void> {
-    this.bot = new Bot(this.botToken, {
+  /**
+   * Build a fresh Grammy Bot instance with all handlers attached.
+   * Each instance gets its own HTTPS agent so that when we destroy the agent
+   * on retry, all underlying TCP connections are forcibly closed — preventing
+   * Telegram from seeing a lingering getUpdates as a competing session.
+   */
+  private buildBot(agent: https.Agent): Bot {
+    const bot = new Bot(this.botToken, {
       client: {
-        baseFetchConfig: { agent: https.globalAgent, compress: true },
+        baseFetchConfig: { agent, compress: true },
       },
     });
 
     // Command to get chat ID (useful for registration)
-    this.bot.command('chatid', (ctx) => {
+    bot.command('chatid', (ctx) => {
       const chatId = ctx.chat.id;
       const chatType = ctx.chat.type;
       const chatName =
@@ -128,7 +137,7 @@ export class TelegramChannel implements Channel {
     });
 
     // Command to check bot status
-    this.bot.command('ping', (ctx) => {
+    bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
     });
 
@@ -136,7 +145,7 @@ export class TelegramChannel implements Channel {
     // so they don't also get stored as messages. All other /commands flow through.
     const TELEGRAM_BOT_COMMANDS = new Set(['chatid', 'ping']);
 
-    this.bot.on('message:text', async (ctx) => {
+    bot.on('message:text', async (ctx) => {
       if (ctx.message.text.startsWith('/')) {
         const cmd = ctx.message.text.slice(1).split(/[\s@]/)[0].toLowerCase();
         if (TELEGRAM_BOT_COMMANDS.has(cmd)) return;
@@ -293,7 +302,7 @@ export class TelegramChannel implements Channel {
       deliver(`${placeholder}${caption}`);
     };
 
-    this.bot.on('message:photo', (ctx) => {
+    bot.on('message:photo', (ctx) => {
       // Telegram sends multiple sizes; last is largest
       const photos = ctx.message.photo;
       const largest = photos?.[photos.length - 1];
@@ -302,19 +311,19 @@ export class TelegramChannel implements Channel {
         filename: `photo_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:video', (ctx) => {
+    bot.on('message:video', (ctx) => {
       storeMedia(ctx, '[Video]', {
         fileId: ctx.message.video?.file_id,
         filename: `video_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:voice', (ctx) => {
+    bot.on('message:voice', (ctx) => {
       storeMedia(ctx, '[Voice message]', {
         fileId: ctx.message.voice?.file_id,
         filename: `voice_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:audio', (ctx) => {
+    bot.on('message:audio', (ctx) => {
       const name =
         ctx.message.audio?.file_name || `audio_${ctx.message.message_id}`;
       storeMedia(ctx, '[Audio]', {
@@ -322,40 +331,94 @@ export class TelegramChannel implements Channel {
         filename: name,
       });
     });
-    this.bot.on('message:document', (ctx) => {
+    bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
       storeMedia(ctx, `[Document: ${name}]`, {
         fileId: ctx.message.document?.file_id,
         filename: name,
       });
     });
-    this.bot.on('message:sticker', (ctx) => {
+    bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
       storeMedia(ctx, `[Sticker ${emoji}]`);
     });
-    this.bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
-    this.bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
+    bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
+    bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
 
-    // Handle errors gracefully
-    this.bot.catch((err) => {
-      logger.error({ err: err.message }, 'Telegram bot error');
+    // Re-throw 409 errors so Grammy stops its internal polling loop and
+    // bot.start() rejects cleanly. If we swallow 409 here, Grammy sees it as
+    // "handled" and keeps hammering getUpdates, sustaining the conflict forever.
+    // All other errors (e.g. from message handlers) are logged and swallowed.
+    bot.catch((err) => {
+      const msg = (err as any)?.message ?? '';
+      const is409 = msg.includes('409') || (err as any)?.error_code === 409;
+      if (is409) throw err;
+      logger.error({ err: msg }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
+    return bot;
+  }
+
+  async connect(): Promise<void> {
+    // Start polling with auto-retry for 409 Conflict (stale session from a
+    // previous run). Each attempt gets a fresh Bot instance AND a fresh HTTPS
+    // agent. On failure the agent is destroyed, forcibly closing all TCP
+    // connections so Telegram's session clears before the next attempt.
+    const CONFLICT_RETRY_DELAY_MS = 15_000;
+
     return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
-      });
+      let resolved = false;
+      let pollingActive = false;
+      let currentAgent: https.Agent | null = null;
+
+      const startPolling = (): void => {
+        if (pollingActive) return;
+
+        // Destroy the previous agent to close all its TCP connections.
+        // This prevents the old getUpdates connection from lingering on
+        // Telegram's side and causing a 409 on the new attempt.
+        if (currentAgent) {
+          currentAgent.destroy();
+        }
+
+        // Fresh agent + fresh Grammy instance for this attempt
+        currentAgent = new https.Agent({ keepAlive: true });
+        const bot = this.buildBot(currentAgent);
+        this.bot = bot;
+
+        bot.start({
+          onStart: (botInfo) => {
+            pollingActive = true;
+            if (!resolved) {
+              resolved = true;
+              logger.info(
+                { username: botInfo.username, id: botInfo.id },
+                'Telegram bot connected',
+              );
+              console.log(`\n  Telegram bot: @${botInfo.username}`);
+              console.log(
+                `  Send /chatid to the bot to get a chat's registration ID\n`,
+              );
+              resolve();
+            }
+          },
+        }).catch((err) => {
+          pollingActive = false;
+          const is409 =
+            err?.message?.includes('409') || err?.error_code === 409;
+          if (is409) {
+            logger.warn(
+              { retryMs: CONFLICT_RETRY_DELAY_MS },
+              'Telegram 409 Conflict — previous session still active, retrying',
+            );
+            setTimeout(startPolling, CONFLICT_RETRY_DELAY_MS);
+          } else {
+            logger.error({ err }, 'Telegram polling stopped');
+          }
+        });
+      };
+
+      startPolling();
     });
   }
 

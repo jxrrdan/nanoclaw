@@ -10,12 +10,11 @@ import { logger } from './logger.js';
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
-  let content: string;
+  let content = '';
   try {
     content = fs.readFileSync(envFile, 'utf-8');
-  } catch (err) {
-    logger.debug({ err }, '.env file not found, using defaults');
-    return {};
+  } catch {
+    logger.debug('.env file not found, falling back to process.env');
   }
 
   const result: Record<string, string> = {};
@@ -37,6 +36,15 @@ export function readEnvFile(keys: string[]): Record<string, string> {
       value = value.slice(1, -1);
     }
     if (value) result[key] = value;
+  }
+
+  // Fall back to process.env for any keys not found in the file.
+  // This covers cloud environments (e.g. AKS) where secrets are injected
+  // as environment variables rather than written to a .env file.
+  for (const key of keys) {
+    if (!result[key] && process.env[key]) {
+      result[key] = process.env[key]!;
+    }
   }
 
   return result;
