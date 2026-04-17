@@ -109,15 +109,18 @@ export class TelegramChannel implements Channel {
   }
 
   /**
-   * Build a fresh Grammy Bot instance with all handlers attached.
-   * Each instance gets its own HTTPS agent so that when we destroy the agent
-   * on retry, all underlying TCP connections are forcibly closed — preventing
-   * Telegram from seeing a lingering getUpdates as a competing session.
+   * Build the Grammy Bot instance and register all update handlers.
+   * We do NOT call bot.start() — polling is driven by runPollingLoop()
+   * which calls bot.api.getUpdates() directly, guaranteeing exactly one
+   * outstanding getUpdates request at all times and eliminating 409s.
    */
-  private buildBot(agent: https.Agent): Bot {
+  private buildBot(): Bot {
     const bot = new Bot(this.botToken, {
       client: {
-        baseFetchConfig: { agent, compress: true },
+        baseFetchConfig: {
+          agent: new https.Agent({ keepAlive: true }),
+          compress: true,
+        },
       },
     });
 
@@ -345,81 +348,85 @@ export class TelegramChannel implements Channel {
     bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
     bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
 
-    // Re-throw 409 errors so Grammy stops its internal polling loop and
-    // bot.start() rejects cleanly. If we swallow 409 here, Grammy sees it as
-    // "handled" and keeps hammering getUpdates, sustaining the conflict forever.
-    // All other errors (e.g. from message handlers) are logged and swallowed.
+    // Log errors from message handlers — don't crash the bot.
     bot.catch((err) => {
-      const msg = (err as any)?.message ?? '';
-      const is409 = msg.includes('409') || (err as any)?.error_code === 409;
-      if (is409) throw err;
-      logger.error({ err: msg }, 'Telegram bot error');
+      logger.error({ err: (err as any)?.message }, 'Telegram bot error');
     });
 
     return bot;
   }
 
-  async connect(): Promise<void> {
-    // Start polling with auto-retry for 409 Conflict (stale session from a
-    // previous run). Each attempt gets a fresh Bot instance AND a fresh HTTPS
-    // agent. On failure the agent is destroyed, forcibly closing all TCP
-    // connections so Telegram's session clears before the next attempt.
-    const CONFLICT_RETRY_DELAY_MS = 15_000;
+  /**
+   * Manual getUpdates polling loop.
+   *
+   * Grammy's bot.start() uses a concurrent Source/Sink runner that can have
+   * two getUpdates calls in-flight simultaneously under certain timing
+   * conditions, producing a self-sustaining 409 loop. By driving polling
+   * ourselves we guarantee exactly ONE outstanding getUpdates at a time:
+   *
+   *   call getUpdates → process each update → call getUpdates → …
+   *
+   * On 409 we simply sleep and retry with the same bot instance — no state
+   * to reset, no new instances, no competing connections.
+   */
+  private async runPollingLoop(): Promise<void> {
+    const CONFLICT_RETRY_MS = 15_000;
+    const ERROR_RETRY_MS = 5_000;
+    let offset = 0;
 
-    return new Promise<void>((resolve) => {
-      let resolved = false;
-      let pollingActive = false;
-      let currentAgent: https.Agent | null = null;
-
-      const startPolling = (): void => {
-        if (pollingActive) return;
-
-        // Destroy the previous agent to close all its TCP connections.
-        // This prevents the old getUpdates connection from lingering on
-        // Telegram's side and causing a 409 on the new attempt.
-        if (currentAgent) {
-          currentAgent.destroy();
-        }
-
-        // Fresh agent + fresh Grammy instance for this attempt
-        currentAgent = new https.Agent({ keepAlive: true });
-        const bot = this.buildBot(currentAgent);
-        this.bot = bot;
-
-        bot.start({
-          onStart: (botInfo) => {
-            pollingActive = true;
-            if (!resolved) {
-              resolved = true;
-              logger.info(
-                { username: botInfo.username, id: botInfo.id },
-                'Telegram bot connected',
-              );
-              console.log(`\n  Telegram bot: @${botInfo.username}`);
-              console.log(
-                `  Send /chatid to the bot to get a chat's registration ID\n`,
-              );
-              resolve();
-            }
-          },
-        }).catch((err) => {
-          pollingActive = false;
-          const is409 =
-            err?.message?.includes('409') || err?.error_code === 409;
-          if (is409) {
-            logger.warn(
-              { retryMs: CONFLICT_RETRY_DELAY_MS },
-              'Telegram 409 Conflict — previous session still active, retrying',
-            );
-            setTimeout(startPolling, CONFLICT_RETRY_DELAY_MS);
-          } else {
-            logger.error({ err }, 'Telegram polling stopped');
-          }
+    for (;;) {
+      try {
+        const updates = await this.bot!.api.getUpdates({
+          offset,
+          timeout: 30,
+          limit: 100,
         });
-      };
 
-      startPolling();
-    });
+        for (const update of updates) {
+          offset = Math.max(offset, update.update_id + 1);
+          try {
+            await this.bot!.handleUpdate(update);
+          } catch (err) {
+            logger.error(
+              { err: (err as any)?.message },
+              'Telegram update handler error',
+            );
+          }
+        }
+      } catch (err: any) {
+        const msg = String(err?.message ?? '');
+        const is409 = msg.includes('409') || err?.error_code === 409;
+        if (is409) {
+          logger.warn(
+            { retryMs: CONFLICT_RETRY_MS },
+            'Telegram 409 Conflict — previous session still active, retrying',
+          );
+          await new Promise((r) => setTimeout(r, CONFLICT_RETRY_MS));
+        } else {
+          logger.warn({ err: msg }, 'Telegram polling error, retrying');
+          await new Promise((r) => setTimeout(r, ERROR_RETRY_MS));
+        }
+      }
+    }
+  }
+
+  async connect(): Promise<void> {
+    this.bot = this.buildBot();
+
+    // Initialise the bot — calls getMe so ctx.me is available in handlers.
+    await this.bot.init();
+    const botInfo = this.bot.botInfo;
+
+    logger.info(
+      { username: botInfo.username, id: botInfo.id },
+      'Telegram bot connected',
+    );
+    console.log(`\n  Telegram bot: @${botInfo.username}`);
+    console.log(`  Send /chatid to the bot to get a chat's registration ID\n`);
+
+    // Start polling in the background — connect() resolves immediately so
+    // the rest of nanoclaw's startup isn't blocked.
+    void this.runPollingLoop();
   }
 
   async sendMessage(
