@@ -10,9 +10,13 @@
 #   cp inventory.example.ini inventory.ini   # fill in your VM IP
 #   ansible-playbook -i inventory.ini playbook.yml
 #
-# Secrets (API keys, OAuth tokens) go into Key Vault — set them in
-# keyvault_secrets below or pass with -e @secrets.yml (ansible-vault encrypted).
-# Non-secret config (ASSISTANT_NAME, TZ, etc.) goes in nanoclaw_env_vars.
+# Secrets (API keys, OAuth tokens) are set manually in Key Vault via the
+# Azure portal or CLI — never stored in this repo. The playbook only provisions
+# the vault and wires up the VM's managed identity to access it.
+# Non-secret config (ASSISTANT_NAME, TZ, etc.) goes in nanoclaw_env_vars below.
+#
+# To set a secret after running this playbook:
+#   az keyvault secret set --vault-name nanoclaw-kv --name ANTHROPIC-API-KEY --value "sk-ant-..."
 
 # ── Play 1: Provision Azure Key Vault and wire up managed identity ────────────
 # Runs on the control machine via Azure CLI. Safe to re-run (idempotent).
@@ -26,12 +30,6 @@
     azure_location: uksouth
     keyvault_name: nanoclaw-kv
     vm_name: "{{ inventory_hostname }}"
-
-    # Secrets stored in Key Vault. Use ansible-vault to encrypt this file.
-    # Key names must use hyphens (Azure Key Vault requirement).
-    keyvault_secrets: {}
-    #   ANTHROPIC-API-KEY: "sk-ant-..."
-    #   CLAUDE-CODE-OAUTH-TOKEN: ""
 
   tasks:
     - name: Assign system-managed identity to VM
@@ -96,18 +94,6 @@
       register: role_assignment
       changed_when: role_assignment.rc == 0
       failed_when: role_assignment.rc != 0 and 'already exists' not in role_assignment.stderr
-
-    - name: Store secrets in Key Vault
-      command: >
-        az keyvault secret set
-        --vault-name {{ keyvault_name }}
-        --name {{ item.key }}
-        --value "{{ item.value }}"
-        --output none
-      delegate_to: localhost
-      loop: "{{ keyvault_secrets | dict2items }}"
-      no_log: true
-      when: keyvault_secrets | length > 0
 
     # Make the vault URI available to the VM play
     - name: Expose Key Vault URI as host fact
