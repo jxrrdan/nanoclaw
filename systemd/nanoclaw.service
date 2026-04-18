@@ -1,0 +1,22 @@
+[Unit]
+Description=NanoClaw Claude Assistant
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User={{DEPLOY_USER}}
+Group={{DEPLOY_USER}}
+WorkingDirectory={{PROJECT_ROOT}}
+ExecStart=/usr/bin/node {{PROJECT_ROOT}}/dist/index.js
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanoclaw
+Environment=HOME={{DEPLOY_HOME}}
+Environment=PATH={{DEPLOY_HOME}}/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target
