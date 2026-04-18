@@ -1,16 +1,120 @@
 ---
 # NanoClaw deployment playbook for a plain Linux VM (replaces AKS).
 #
+# Prerequisites:
+#   - Azure CLI installed and logged in (`az login`) on the control machine
+#   - SSH access to the target VM
+#   - The VM already exists in Azure (created via portal, Terraform, etc.)
+#
 # Usage:
 #   cp inventory.example.ini inventory.ini   # fill in your VM IP
 #   ansible-playbook -i inventory.ini playbook.yml
 #
-# The playbook installs Node.js 22, Docker CE, clones the repo, builds
-# the agent container image, and runs NanoClaw as a systemd service.
-#
-# Secrets are read from .env on the host — copy your existing .env to
-# {{ deploy_home }}/.nanoclaw.env before running, or set it via the
-# nanoclaw_env_vars dict below and the playbook will write it.
+# Secrets (API keys, OAuth tokens) go into Key Vault — set them in
+# keyvault_secrets below or pass with -e @secrets.yml (ansible-vault encrypted).
+# Non-secret config (ASSISTANT_NAME, TZ, etc.) goes in nanoclaw_env_vars.
+
+# ── Play 1: Provision Azure Key Vault and wire up managed identity ────────────
+# Runs on the control machine via Azure CLI. Safe to re-run (idempotent).
+
+- name: Provision Azure Key Vault
+  hosts: nanoclaw
+  gather_facts: false
+
+  vars:
+    azure_resource_group: nanoclaw-rg
+    azure_location: uksouth
+    keyvault_name: nanoclaw-kv
+    vm_name: "{{ inventory_hostname }}"
+
+    # Secrets stored in Key Vault. Use ansible-vault to encrypt this file.
+    # Key names must use hyphens (Azure Key Vault requirement).
+    keyvault_secrets: {}
+    #   ANTHROPIC-API-KEY: "sk-ant-..."
+    #   CLAUDE-CODE-OAUTH-TOKEN: ""
+
+  tasks:
+    - name: Assign system-managed identity to VM
+      command: >
+        az vm identity assign
+        --resource-group {{ azure_resource_group }}
+        --name {{ vm_name }}
+      delegate_to: localhost
+      register: identity_result
+      changed_when: true
+
+    - name: Get VM principal ID
+      command: >
+        az vm show
+        --resource-group {{ azure_resource_group }}
+        --name {{ vm_name }}
+        --query identity.principalId
+        --output tsv
+      delegate_to: localhost
+      register: vm_principal_id
+      changed_when: false
+
+    - name: Create Key Vault (RBAC mode)
+      command: >
+        az keyvault create
+        --name {{ keyvault_name }}
+        --resource-group {{ azure_resource_group }}
+        --location {{ azure_location }}
+        --enable-rbac-authorization true
+      delegate_to: localhost
+      register: kv_create
+      changed_when: kv_create.rc == 0
+      failed_when: kv_create.rc != 0 and 'already exists' not in kv_create.stderr
+
+    - name: Get Key Vault resource ID
+      command: >
+        az keyvault show
+        --name {{ keyvault_name }}
+        --query id
+        --output tsv
+      delegate_to: localhost
+      register: keyvault_id
+      changed_when: false
+
+    - name: Get Key Vault URI
+      command: >
+        az keyvault show
+        --name {{ keyvault_name }}
+        --query properties.vaultUri
+        --output tsv
+      delegate_to: localhost
+      register: keyvault_uri
+      changed_when: false
+
+    - name: Grant VM identity Key Vault Secrets User role
+      command: >
+        az role assignment create
+        --assignee {{ vm_principal_id.stdout | trim }}
+        --role "Key Vault Secrets User"
+        --scope {{ keyvault_id.stdout | trim }}
+      delegate_to: localhost
+      register: role_assignment
+      changed_when: role_assignment.rc == 0
+      failed_when: role_assignment.rc != 0 and 'already exists' not in role_assignment.stderr
+
+    - name: Store secrets in Key Vault
+      command: >
+        az keyvault secret set
+        --vault-name {{ keyvault_name }}
+        --name {{ item.key }}
+        --value "{{ item.value }}"
+        --output none
+      delegate_to: localhost
+      loop: "{{ keyvault_secrets | dict2items }}"
+      no_log: true
+      when: keyvault_secrets | length > 0
+
+    # Make the vault URI available to the VM play
+    - name: Expose Key Vault URI as host fact
+      set_fact:
+        nanoclaw_keyvault_uri: "{{ keyvault_uri.stdout | trim }}"
+
+# ── Play 2: Configure the VM and deploy NanoClaw ─────────────────────────────
 
 - name: Deploy NanoClaw
   hosts: nanoclaw
@@ -24,13 +128,11 @@
     repo_branch: main
     node_version: "22"
 
-    # Optional: set these to have the playbook write the .env file.
-    # Leave empty to manage .env manually on the server.
-    # nanoclaw_env_vars:
-    #   ASSISTANT_NAME: Andy
-    #   ASSISTANT_HAS_OWN_NUMBER: "false"
-    #   ANTHROPIC_API_KEY: "sk-ant-..."
-    nanoclaw_env_vars: {}
+    # Non-secret config written to .env. Secrets go to Key Vault above.
+    nanoclaw_env_vars:
+      ASSISTANT_NAME: Andy
+      ASSISTANT_HAS_OWN_NUMBER: "false"
+      # TZ: Europe/London
 
   tasks:
     # ── System packages ──────────────────────────────────────────────
@@ -151,7 +253,7 @@
 
     # ── Environment ───────────────────────────────────────────────────
 
-    - name: Write .env file
+    - name: Write non-secret config to .env
       lineinfile:
         path: "{{ project_root }}/.env"
         line: "{{ item.key }}={{ item.value }}"
@@ -161,16 +263,13 @@
         group: "{{ deploy_user }}"
         mode: "0600"
       loop: "{{ nanoclaw_env_vars | dict2items }}"
-      when: nanoclaw_env_vars | length > 0
-      no_log: true
 
-    - name: Ensure .env exists
-      file:
+    - name: Write AZURE_KEYVAULT_URL to .env
+      lineinfile:
         path: "{{ project_root }}/.env"
-        state: touch
-        owner: "{{ deploy_user }}"
-        group: "{{ deploy_user }}"
-        mode: "0600"
+        line: "AZURE_KEYVAULT_URL={{ nanoclaw_keyvault_uri }}"
+        regexp: "^AZURE_KEYVAULT_URL="
+      when: nanoclaw_keyvault_uri is defined
 
     # ── Systemd service ───────────────────────────────────────────────
 
@@ -183,7 +282,7 @@
         DEPLOY_USER: "{{ deploy_user }}"
         DEPLOY_HOME: "{{ deploy_home }}"
         PROJECT_ROOT: "{{ project_root }}"
-      notify: Reload systemd
+      notify: Reload systemd and restart nanoclaw
 
     - name: Enable and start nanoclaw
       systemd:
@@ -193,6 +292,8 @@
         daemon_reload: true
 
   handlers:
-    - name: Reload systemd
+    - name: Reload systemd and restart nanoclaw
       systemd:
+        name: nanoclaw
+        state: restarted
         daemon_reload: true

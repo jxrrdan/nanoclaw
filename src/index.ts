@@ -13,6 +13,8 @@ import {
   TIMEZONE,
 } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { loadKeyVaultSecrets } from './azure-keyvault.js';
+import { readEnvFile } from './env.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -550,6 +552,17 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
   restoreRemoteControl();
+
+  // Load secrets from Azure Key Vault before starting the credential proxy.
+  // Falls back gracefully to .env if AZURE_KEYVAULT_URL is not set.
+  const { AZURE_KEYVAULT_URL } = readEnvFile(['AZURE_KEYVAULT_URL']);
+  if (AZURE_KEYVAULT_URL) {
+    try {
+      await loadKeyVaultSecrets(AZURE_KEYVAULT_URL);
+    } catch (err) {
+      logger.error({ err }, 'Key Vault load failed — falling back to .env');
+    }
+  }
 
   // Start credential proxy (containers route API calls through this)
   const proxyServer = await startCredentialProxy(

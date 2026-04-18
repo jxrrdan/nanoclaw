@@ -2,11 +2,21 @@ import fs from 'fs';
 import path from 'path';
 import { logger } from './logger.js';
 
+// In-memory cache populated at startup (e.g. from Azure Key Vault).
+// Takes priority over .env and process.env so secrets never need to be on disk.
+let _secretsCache: Record<string, string> = {};
+
+export function setSecretsCache(secrets: Record<string, string>): void {
+  _secretsCache = { ..._secretsCache, ...secrets };
+}
+
 /**
  * Parse the .env file and return values for the requested keys.
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
+ *
+ * Priority: in-memory cache (Key Vault) > .env file > process.env
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
@@ -39,11 +49,17 @@ export function readEnvFile(keys: string[]): Record<string, string> {
   }
 
   // Fall back to process.env for any keys not found in the file.
-  // This covers cloud environments (e.g. AKS) where secrets are injected
-  // as environment variables rather than written to a .env file.
   for (const key of keys) {
     if (!result[key] && process.env[key]) {
       result[key] = process.env[key]!;
+    }
+  }
+
+  // In-memory cache (Key Vault) overrides everything — applied last so secrets
+  // loaded at startup always win over stale .env values.
+  for (const key of keys) {
+    if (_secretsCache[key]) {
+      result[key] = _secretsCache[key];
     }
   }
 
