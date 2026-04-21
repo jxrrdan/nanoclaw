@@ -259,10 +259,10 @@ function buildContainerArgs(
     `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
   );
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
+  // Set the auth placeholder the container's SDK will send.
+  // The credential proxy injects real credentials based on which placeholder
+  // it receives. Primary mode is OAuth (Claude.ai plan); the proxy switches
+  // new spawns to API key automatically if the plan quota is exhausted.
   const authMode = detectAuthMode();
   if (authMode === 'api-key') {
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');

@@ -10,13 +10,18 @@
 #   cp inventory.example.ini inventory.ini   # fill in your VM IP
 #   ansible-playbook -i inventory.ini playbook.yml
 #
-# Secrets (API keys, OAuth tokens) are set manually in Key Vault via the
-# Azure portal or CLI — never stored in this repo. The playbook only provisions
-# the vault and wires up the VM's managed identity to access it.
-# Non-secret config (ASSISTANT_NAME, TZ, etc.) goes in nanoclaw_env_vars below.
+# Secrets are set manually in Key Vault — never in this repo.
+# NanoClaw uses the Claude.ai OAuth plan as primary (no per-token cost) and
+# falls back to the Anthropic API key automatically when the plan quota is hit.
+# Both secrets must be stored in Key Vault:
 #
-# To set a secret after running this playbook:
-#   az keyvault secret set --vault-name nanoclaw-kv --name ANTHROPIC-API-KEY --value "sk-ant-..."
+#   # Primary: OAuth token from `claude login` on any authenticated machine
+#   az keyvault secret set --vault-name nanoclaw-kv \
+#     --name CLAUDE-CODE-OAUTH-TOKEN --value "<token from ~/.claude/.credentials.json>"
+#
+#   # Fallback: Anthropic API key (pay-per-use, only consumed when plan is exhausted)
+#   az keyvault secret set --vault-name nanoclaw-kv \
+#     --name ANTHROPIC-API-KEY --value "sk-ant-..."
 
 # ── Play 1: Provision Azure Key Vault and wire up managed identity ────────────
 # Runs on the control machine via Azure CLI. Safe to re-run (idempotent).
