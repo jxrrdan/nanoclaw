@@ -52,8 +52,8 @@ Write-Host ""
 Write-Host "Waiting for deletion to complete (this takes 5-10 minutes)..." -ForegroundColor Yellow
 $deleted = $false
 for ($i = 0; $i -lt 120; $i++) {
-    $rg = az group show --name $oldRg --query "id" -o tsv 2>$null
-    if ([string]::IsNullOrEmpty($rg)) {
+    $exists = az group exists --name $oldRg
+    if ($exists -eq "false") {
         $deleted = $true
         break
     }
