@@ -26,7 +26,8 @@ echo "Configuration:"
 echo "  Old resource group: $OLD_RG"
 echo "  New resource group: $NEW_RG"
 echo "  Location: $LOCATION"
-echo "  VM SKU: $VM_SKU (Standard_B1s ≈ £5/month)"
+echo "  VM SKU: $VM_SKU (approx £5/month)"
+echo "  Disk: 20GB"
 echo "  OS: Ubuntu 22.04 LTS"
 echo ""
 
@@ -130,7 +131,7 @@ az vm create \
   --image "$IMAGE" \
   --admin-username azureuser \
   --generate-ssh-keys \
-  --os-disk-size-gb 30 \
+  --os-disk-size-gb 20 \
   --os-disk-name "${VM_NAME}-osdisk" \
   --output none
 echo "✅ VM created"
@@ -162,7 +163,8 @@ echo ""
 echo "New VM Details:"
 echo "  Resource Group: $NEW_RG"
 echo "  VM Name: $VM_NAME"
-echo "  SKU: $VM_SKU (≈ £5/month)"
+echo "  SKU: $VM_SKU (approx £5/month)"
+echo "  Disk: 20GB"
 echo "  Public IP: $PUBLIC_IP"
 echo "  SSH User: azureuser"
 echo "  Location: $LOCATION"
