@@ -32,17 +32,12 @@ Write-Host ""
 
 # Step 2: Create WSL user if needed
 Write-Host "Step 2: Setting up WSL2 user..." -ForegroundColor Yellow
-$wsl_check = wsl -u root id -u nanoclaw 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "  Creating WSL user: $wsl_user"
-    wsl -u root useradd -m -s /bin/bash nanoclaw
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[OK] WSL user created"
-    } else {
-        Write-Host "[WARN] Could not create WSL user (may already exist)"
-    }
+Write-Host "  Creating WSL user: $wsl_user (if not exists)"
+wsl -u root bash -c "id nanoclaw > /dev/null 2>&1 || useradd -m -s /bin/bash nanoclaw"
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "[OK] WSL user ready"
 } else {
-    Write-Host "[OK] WSL user already exists"
+    Write-Host "[WARN] WSL user setup may have failed, continuing anyway..."
 }
 
 Write-Host ""
