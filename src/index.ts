@@ -12,7 +12,11 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { startCredentialProxy } from './credential-proxy.js';
+import {
+  startCredentialProxy,
+  setAuthModeOverride,
+  detectAuthMode,
+} from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -619,6 +623,45 @@ async function main(): Promise<void> {
         handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Remote control command error'),
         );
+        return;
+      }
+
+      // Auth mode override commands — main group only
+      if (
+        trimmed === '/use-oauth' ||
+        trimmed === '/use-api-key' ||
+        trimmed === '/reset-auth'
+      ) {
+        const group = registeredGroups[chatJid];
+        const channel = findChannel(channels, chatJid);
+        if (group?.isMain && channel) {
+          if (trimmed === '/use-oauth') {
+            setAuthModeOverride('oauth');
+            logger.info('Auth mode manually overridden to oauth');
+            channel
+              .sendMessage(
+                chatJid,
+                'Auth mode forced to OAuth. New containers will use Claude Code OAuth.',
+              )
+              .catch(() => {});
+          } else if (trimmed === '/use-api-key') {
+            setAuthModeOverride('api-key');
+            logger.info('Auth mode manually overridden to api-key');
+            channel
+              .sendMessage(chatJid, 'Auth mode forced to API key.')
+              .catch(() => {});
+          } else {
+            setAuthModeOverride(null);
+            logger.info('Auth mode override cleared, reverting to auto-detect');
+            const detected = detectAuthMode();
+            channel
+              .sendMessage(
+                chatJid,
+                `Auth mode override cleared. Auto-detected: ${detected}.`,
+              )
+              .catch(() => {});
+          }
+        }
         return;
       }
 

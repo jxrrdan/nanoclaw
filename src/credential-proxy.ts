@@ -23,6 +23,17 @@ export interface ProxyConfig {
   authMode: AuthMode;
 }
 
+/** Runtime override — null means auto-detect from env on each use. */
+let authModeOverride: AuthMode | null = null;
+
+export function setAuthModeOverride(mode: AuthMode | null): void {
+  authModeOverride = mode;
+}
+
+export function getAuthModeOverride(): AuthMode | null {
+  return authModeOverride;
+}
+
 export function startCredentialProxy(
   port: number,
   host = '127.0.0.1',
@@ -34,7 +45,7 @@ export function startCredentialProxy(
     'ANTHROPIC_BASE_URL',
   ]);
 
-  const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
+  const baseAuthMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
   const oauthToken =
     secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
 
@@ -61,6 +72,9 @@ export function startCredentialProxy(
         delete headers['connection'];
         delete headers['keep-alive'];
         delete headers['transfer-encoding'];
+
+        // Re-read override on every request so /use-oauth takes effect immediately
+        const authMode = authModeOverride ?? baseAuthMode;
 
         if (authMode === 'api-key') {
           // API key mode: inject x-api-key on every request
@@ -110,7 +124,7 @@ export function startCredentialProxy(
     });
 
     server.listen(port, host, () => {
-      logger.info({ port, host, authMode }, 'Credential proxy started');
+      logger.info({ port, host, authMode: baseAuthMode }, 'Credential proxy started');
       resolve(server);
     });
 
@@ -118,8 +132,9 @@ export function startCredentialProxy(
   });
 }
 
-/** Detect which auth mode the host is configured for. */
+/** Detect which auth mode to use, respecting any runtime override. */
 export function detectAuthMode(): AuthMode {
+  if (authModeOverride !== null) return authModeOverride;
   const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
   return secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
 }
